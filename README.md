@@ -24,7 +24,7 @@ Replayed locally against the kit's frozen dev window (1,440 1-minute bars) with 
 
 | Metric | Value |
 |---|---|
-| Net PnL | **+$10.33** on $1,000 |
+| Net PnL | **+$10.84** on $1,000 |
 | Max drawdown | 0.79% |
 | Trades | 6 |
 | Fees paid | $1.61 |

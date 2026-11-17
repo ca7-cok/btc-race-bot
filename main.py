@@ -18,8 +18,9 @@ in two tranches, and never chases a trend:
 * Buy tranche 1: half the equity when z <= -1.8.
 * Buy tranche 2: the other half when z <= -2.6 while tranche 1 is held.
 * Sell everything: when z >= +1.2, when the position is 1.5% below its
-  blended entry price (stop-loss), or when it gives back 1.0% from its
-  post-entry peak while still in profit (trailing exit).
+  blended entry price (stop-loss), when it gives back 1.0% from its
+  post-entry peak while still in profit (trailing exit), or when it has
+  been held over 6 hours without the band turning back up (stale exit).
 * A 3-bar cooldown between decisions keeps the bot from stacking orders on
   the same move, and every order caps its slippage at 100 bps.
 * Sizing is impact-aware: a tranche is halved while its modelled price
@@ -49,6 +50,8 @@ Z_BUY_SECOND = 2.6       # sigma below to add tranche 2
 Z_SELL = 1.2             # sigma above to close the whole position
 STOP_LOSS = 0.015        # close if 1.5% below the blended entry price
 TRAIL_DROP = 0.010       # close if 1.0% below the post-entry peak, in profit
+HELD_MAX_BARS = 360      # close a stale position held over 6 hours (z > 0)
+TRANCHE_GAP_BARS = 10    # bars to wait after tranche 1 before tranche 2
 MAX_IMPACT_BPS = 10      # halve a tranche while its impact exceeds this
 TRANCHE = 0.5            # each tranche is half of equity
 COOLDOWN_BARS = 3        # bars to wait after any decision
@@ -64,6 +67,7 @@ class DipCatcher:
         self.last_bar_t = None    # close time of the last bar appended
         self.entry_price = 0.0    # blended entry, USD, at decision closes
         self.peak_since_entry = 0.0  # highest close seen while holding
+        self.entry_seq = 0         # seq the current position was opened on
         self.second_tranche = False
         self.last_action_seq = -10 ** 9
 
@@ -121,8 +125,11 @@ class DipCatcher:
                 in_profit
                 and price_usd <= self.peak_since_entry * (1 - TRAIL_DROP)
             )
-            # Exit: strength above the band, the stop-loss, or the trail.
-            if z >= Z_SELL or price_usd / self.entry_price - 1 <= -STOP_LOSS or trailing:
+            stale = (
+                state.seq - self.entry_seq > HELD_MAX_BARS and z > 0
+            )
+            # Exit: strength, stop-loss, trail, or a stale position.
+            if z >= Z_SELL or price_usd / self.entry_price - 1 <= -STOP_LOSS or trailing or stale:
                 self.last_action_seq = state.seq
                 self.entry_price = 0.0
                 self.peak_since_entry = 0.0
@@ -134,7 +141,10 @@ class DipCatcher:
                     "max_slippage_bps": MAX_SLIPPAGE_BPS,
                 }]
             # Add tranche 2 on a deeper dip, sized to the remaining room.
-            if not self.second_tranche and z <= -Z_BUY_SECOND:
+            # Wait a little after tranche 1: never double down on the same
+            # minute's dip.
+            if (not self.second_tranche and z <= -Z_BUY_SECOND
+                    and state.seq - self.entry_seq >= TRANCHE_GAP_BARS):
                 size = self.sized_buy(state, int(TRANCHE * state.equity))
                 if size >= 1_000_000:  # at least 1 USDC
                     self.last_action_seq = state.seq
@@ -161,6 +171,7 @@ class DipCatcher:
                 self.last_action_seq = state.seq
                 self.entry_price = price_usd
                 self.peak_since_entry = price_usd
+                self.entry_seq = state.seq
                 self.second_tranche = False
                 return [{
                     "side": "buy",
