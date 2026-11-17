@@ -17,10 +17,14 @@ in two tranches, and never chases a trend:
   (4 hours). A bar's z-score is (close - mean) / std.
 * Buy tranche 1: half the equity when z <= -1.8.
 * Buy tranche 2: the other half when z <= -2.6 while tranche 1 is held.
-* Sell everything: when z >= +1.2, or when the position is 1.5% below its
-  blended entry price (stop-loss).
+* Sell everything: when z >= +1.2, when the position is 1.5% below its
+  blended entry price (stop-loss), or when it gives back 1.0% from its
+  post-entry peak while still in profit (trailing exit).
 * A 3-bar cooldown between decisions keeps the bot from stacking orders on
   the same move, and every order caps its slippage at 100 bps.
+* Sizing is impact-aware: a tranche is halved while its modelled price
+  impact would exceed 10 bps, so a thin pool never turns a good signal
+  into an expensive fill.
 
 Costs decide the thresholds. A full-size round trip pays about 26 bps in
 fees, slippage and price impact, so a trade has to catch a move well above
@@ -44,6 +48,8 @@ Z_BUY_FIRST = 1.8        # sigma below the band mean to open tranche 1
 Z_BUY_SECOND = 2.6       # sigma below to add tranche 2
 Z_SELL = 1.2             # sigma above to close the whole position
 STOP_LOSS = 0.015        # close if 1.5% below the blended entry price
+TRAIL_DROP = 0.010       # close if 1.0% below the post-entry peak, in profit
+MAX_IMPACT_BPS = 10      # halve a tranche while its impact exceeds this
 TRANCHE = 0.5            # each tranche is half of equity
 COOLDOWN_BARS = 3        # bars to wait after any decision
 MAX_SLIPPAGE_BPS = 100   # 1%: generous vs a 1-minute move, tight vs a bad fill
@@ -57,8 +63,19 @@ class DipCatcher:
         self.closes = []          # closes in USD, one per bar seen
         self.last_bar_t = None    # close time of the last bar appended
         self.entry_price = 0.0    # blended entry, USD, at decision closes
+        self.peak_since_entry = 0.0  # highest close seen while holding
         self.second_tranche = False
         self.last_action_seq = -10 ** 9
+
+    def sized_buy(self, state, want):
+        """A buy size in quote units, halved while its impact is too big."""
+        size = min(state.cash, state.weight_room(SYMBOL), want)
+        while size >= 2_000_000:  # keep at least 1 USDC after halving
+            impact = state.impact_bps(SYMBOL, size)
+            if impact is None or impact <= MAX_IMPACT_BPS:
+                break
+            size //= 2
+        return size
 
     def note_bar(self, batch):
         """Append this batch's CBBTC close once (a missing minute has no bar)."""
@@ -98,10 +115,17 @@ class DipCatcher:
         z = (price_usd - mean) / std
 
         if qty > 0:
-            # Exit: strength above the band, or the stop-loss.
-            if z >= Z_SELL or price_usd / self.entry_price - 1 <= -STOP_LOSS:
+            self.peak_since_entry = max(self.peak_since_entry, price_usd)
+            in_profit = price_usd > self.entry_price
+            trailing = (
+                in_profit
+                and price_usd <= self.peak_since_entry * (1 - TRAIL_DROP)
+            )
+            # Exit: strength above the band, the stop-loss, or the trail.
+            if z >= Z_SELL or price_usd / self.entry_price - 1 <= -STOP_LOSS or trailing:
                 self.last_action_seq = state.seq
                 self.entry_price = 0.0
+                self.peak_since_entry = 0.0
                 self.second_tranche = False
                 return [{
                     "side": "sell",
@@ -111,8 +135,7 @@ class DipCatcher:
                 }]
             # Add tranche 2 on a deeper dip, sized to the remaining room.
             if not self.second_tranche and z <= -Z_BUY_SECOND:
-                room = state.weight_room(SYMBOL)
-                size = min(state.cash, room, int(TRANCHE * state.equity))
+                size = self.sized_buy(state, int(TRANCHE * state.equity))
                 if size >= 1_000_000:  # at least 1 USDC
                     self.last_action_seq = state.seq
                     self.second_tranche = True
@@ -133,11 +156,11 @@ class DipCatcher:
 
         # Flat: open tranche 1 on a deep dip.
         if z <= -Z_BUY_FIRST:
-            room = state.weight_room(SYMBOL)
-            size = min(state.cash, room, int(TRANCHE * state.equity))
+            size = self.sized_buy(state, int(TRANCHE * state.equity))
             if size >= 1_000_000:  # at least 1 USDC
                 self.last_action_seq = state.seq
                 self.entry_price = price_usd
+                self.peak_since_entry = price_usd
                 self.second_tranche = False
                 return [{
                     "side": "buy",
